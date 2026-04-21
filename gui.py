@@ -86,9 +86,12 @@ class App:
         self.system_paused.set()
 
         # ── Internal state ────────────────────────────────────────────────────
-        self._log_q         = queue.Queue()
-        self._sys_running   = False
-        self._marge_active  = False
+        self._log_q           = queue.Queue()
+        self._sys_running     = False
+        self._marge_active    = False
+        self._is_estopped     = False   # True after E-stop, until resume clears it
+        self._homer_block_idx = 0       # Which grid block Homer resumes from
+        self._bart_cycle_count= 0       # How many sort cycles Bart has completed
         self._status = {"Homer": "Offline", "Bart": "Offline", "Marge": "Offline"}
 
         self._build_ui()
@@ -297,7 +300,7 @@ class App:
 
         self._start_btn = tk.Button(
             bar, text="▶   START SYSTEM",
-            command=self._start,
+            command=self._start_or_resume,
             bg=self.GREEN, fg="white",
             font=("Segoe UI", 11, "bold"),
             width=18, height=2, relief="flat",
@@ -412,7 +415,7 @@ class App:
 
     def _refresh_marge_indicator(self):
         if self._marge_active:
-            self._marge_ind.config(text="●  Fulfilling order — sorting paused",
+            self._marge_ind.config(text="●  Fulfilling order",
                                     fg=self.MARGE_C)
             self._status_dot.config(text="●  MARGE ACTIVE", fg=self.MARGE_C)
         elif not self._sys_running:
@@ -491,19 +494,72 @@ class App:
     # SYSTEM CONTROLS
     # ══════════════════════════════════════════════════════════════════════════
 
+    def _start_or_resume(self):
+        """Routes the START/RESUME button to the correct method."""
+        if self._is_estopped:
+            self._resume()
+        else:
+            self._start()
+
     def _start(self):
+        """Fresh start — reset all counters and spawn workers."""
+        self._homer_block_idx  = 0
+        self._bart_cycle_count = 0
+        self._is_estopped      = False
         self.stop_signal.clear()
         self.system_paused.set()
         self.ok_to_sort.set()
         self.bart_ready_to_scan.set()
+        self.block_on_belt.clear()
+        self.homer_at_sensor.clear()
         self._sys_running = True
 
-        self._start_btn.config(state="disabled")
+        self._start_btn.config(state="disabled", text="▶   START SYSTEM", bg=self.GREEN)
         self._pause_btn.config(state="normal", text="⏸   PAUSE", bg=self.AMBER)
         self._status_dot.config(text="●  INITIALISING...", fg=self.BLUE)
 
         # Redirect all robot print() calls into the GUI log
         sys.stdout = _StdoutRedirect(self._log)
+
+        threading.Thread(target=self._homer_worker, daemon=True).start()
+        threading.Thread(target=self._bart_worker,  daemon=True).start()
+        threading.Thread(target=self._marge_worker, daemon=True).start()
+
+    def _resume(self):
+        """
+        Resume after E-stop — reuse existing robot connections, restart workers
+        from the saved block/cycle indices.  Workers are all dead at this point
+        (they exited via InterruptedError) so serial-port access from the main
+        thread here is safe.
+        """
+        self._is_estopped = False
+        self.stop_signal.clear()
+        self.system_paused.set()
+        self.ok_to_sort.set()
+        self.bart_ready_to_scan.set()
+        self.block_on_belt.clear()
+        self.homer_at_sensor.clear()
+        self._sys_running  = True
+        self._marge_active = False
+
+        self._start_btn.config(state="disabled", text="▶   START SYSTEM", bg=self.GREEN)
+        self._pause_btn.config(state="normal", text="⏸   PAUSE", bg=self.AMBER)
+        self._status_dot.config(text="●  RESUMING...", fg=self.BLUE)
+
+        # Clear alarms and restart command queues on each robot.
+        # Safe here because all worker threads have exited.
+        for robot in (self.homer, self.bart, self.marge):
+            if robot:
+                try:
+                    robot.device.clear_alarms()
+                    robot.device._set_queued_cmd_start_exec()
+                except Exception:
+                    pass
+
+        self._log(
+            f"Resuming — Homer from block {self._homer_block_idx + 1}/16, "
+            f"Bart from cycle {self._bart_cycle_count + 1}/16.", "warn"
+        )
 
         threading.Thread(target=self._homer_worker, daemon=True).start()
         threading.Thread(target=self._bart_worker,  daemon=True).start()
@@ -520,25 +576,36 @@ class App:
             self._log("System resumed.", "info")
 
     def _estop(self):
+        """
+        Immediate E-stop:
+          1. Set stop_signal — polling loops in _move()/_sleep() detect this
+             within 10 ms and call hw_stop() from the worker thread (thread-safe).
+          2. Unblock every wait() so no thread stays blocked forever.
+          3. Offer RESUME button — robots stay connected for restart.
+        hw_stop() is NOT called from the main thread here to avoid racing
+        the worker threads on the serial port.
+        """
         self._log("!!! EMERGENCY STOP !!!", "error")
         self.stop_signal.set()
-        # Unblock every waiting event so threads can exit
+
+        # Unblock every blocking wait() so worker threads can reach the
+        # stop_signal check and exit cleanly
         for evt in (self.ok_to_sort, self.bart_ready_to_scan,
                     self.homer_at_sensor, self.block_on_belt, self.system_paused):
             evt.set()
+
         self._sys_running  = False
         self._marge_active = False
-        self._start_btn.config(state="normal")
+        self._is_estopped  = True
+
+        # Change START → RESUME (teal colour to distinguish from green START)
+        self._start_btn.config(
+            text="↺   RESUME", bg="#16a085",
+            activebackground="#0e6655", state="normal"
+        )
         self._pause_btn.config(state="disabled")
         self._place_btn.config(state="disabled")
-        # Stop hardware command queues and cut suction on all robots immediately
-        for robot in (self.homer, self.bart, self.marge):
-            if robot:
-                try:
-                    robot.hw_stop()          # clears Dobot queue → arm decelerates to halt
-                    robot.device.clear_alarms()
-                except Exception:
-                    pass
+        self._status_dot.config(text="●  E-STOPPED", fg=self.RED)
 
     def _on_close(self):
         """Clean shutdown when the window X button is pressed."""
@@ -562,20 +629,29 @@ class App:
 
     def _homer_worker(self):
         try:
-            self._status["Homer"] = "Connecting..."
-            self.homer = Homer(port='COM7')
-            self.homer.stop_event = self.stop_signal
-            self.homer.setup()
-            self._status["Homer"] = "Ready"
-            self._log("Homer online.", "info")
+            if self.homer is None:
+                # ── Fresh start ──────────────────────────────────────────────
+                self._status["Homer"] = "Connecting..."
+                self.homer = Homer(port='COM7')
+                self.homer.stop_event = self.stop_signal
+                self.homer.setup()
+                self._status["Homer"] = "Ready"
+                self._log("Homer online.", "info")
+            else:
+                # ── Resume after E-stop ──────────────────────────────────────
+                self.homer.stop_event = self.stop_signal
+                self._status["Homer"] = "Resuming..."
+                self._log(f"Homer resuming from block {self._homer_block_idx + 1}/16.", "warn")
 
-            for block_index in range(16):
+            start_idx = self._homer_block_idx
+            for block_index in range(start_idx, 16):
                 if self.stop_signal.is_set():
                     break
                 self._status["Homer"] = f"Waiting  ({block_index + 1}/16)"
 
-                # Gate: wait for Marge to finish AND user not paused AND Bart ready
-                self.ok_to_sort.wait()
+                # Gate: wait for user pause to clear AND Bart to finish previous sort
+                # (tray_lock inside pick_from_tray handles Marge collision — no need
+                #  to pause Homer here while Marge is fulfilling an order)
                 self.system_paused.wait()
                 self.bart_ready_to_scan.wait()
                 if self.stop_signal.is_set():
@@ -592,23 +668,41 @@ class App:
                 self.homer.place_on_conveyor()
                 self.block_on_belt.set()
 
-            self._status["Homer"] = "Done (16/16)"
-            self._log("Homer: all 16 grid blocks processed.", "ok")
+                # Advance resume pointer only after full success
+                self._homer_block_idx = block_index + 1
 
+            if not self.stop_signal.is_set():
+                self._status["Homer"] = "Done (16/16)"
+                self._homer_block_idx = 0   # reset for a potential new run
+                self._log("Homer: all 16 grid blocks processed.", "ok")
+
+        except InterruptedError:
+            self._status["Homer"] = "E-stopped"
+            self._log(f"Homer stopped by E-stop (will resume from block "
+                      f"{self._homer_block_idx + 1}/16).", "warn")
         except Exception as exc:
             self._status["Homer"] = "ERROR"
             self._log(f"Homer error: {exc}", "error")
 
     def _bart_worker(self):
         try:
-            self._status["Bart"] = "Connecting..."
-            self.bart = Bart(port='COM8')
-            self.bart.stop_event = self.stop_signal
-            self.bart.setup()
-            self._status["Bart"] = "Ready"
-            self._log("Bart online.", "info")
+            if self.bart is None:
+                # ── Fresh start ──────────────────────────────────────────────
+                self._status["Bart"] = "Connecting..."
+                self.bart = Bart(port='COM8')
+                self.bart.stop_event = self.stop_signal
+                self.bart.setup()
+                self._status["Bart"] = "Ready"
+                self._log("Bart online.", "info")
+            else:
+                # ── Resume after E-stop ──────────────────────────────────────
+                self.bart.stop_event = self.stop_signal
+                self.bart.setup()   # re-enables sensor, lifts to safe Z, clears alarms
+                self._status["Bart"] = "Resuming..."
+                self._log(f"Bart resuming from cycle {self._bart_cycle_count + 1}/16.", "warn")
 
-            for _ in range(16):
+            remaining = 16 - self._bart_cycle_count
+            for _ in range(remaining):
                 if self.stop_signal.is_set():
                     break
                 self._status["Bart"] = "Waiting for sensor..."
@@ -633,19 +727,20 @@ class App:
                 self.block_on_belt.wait()
                 self.block_on_belt.clear()
 
-                # Pause here if Marge is working or user paused
-                self.ok_to_sort.wait()
+                # Pause here only if user manually paused the system.
+                # Marge's tray access is handled by tray_lock inside place_block —
+                # Bart can sort freely while Marge travels to/from dispatch.
                 self.system_paused.wait()
                 if self.stop_signal.is_set():
                     break
 
                 self._status["Bart"] = "Waiting for belt travel..."
-                # Interruptible — checks stop_signal every 50 ms
+                # Interruptible — checks stop_signal every 10 ms
                 deadline = time.time() + 5.0
                 while time.time() < deadline:
                     if self.stop_signal.is_set():
                         break
-                    time.sleep(0.05)
+                    time.sleep(0.01)
                 if self.stop_signal.is_set():
                     break
 
@@ -658,27 +753,40 @@ class App:
                     self.bart.place_block()
                     self.bart.go_safe()
 
+                # Advance resume pointer only after a complete successful cycle
+                self._bart_cycle_count += 1
                 self._status["Bart"] = "Idle"
                 self.bart_ready_to_scan.set()
 
-            self._status["Bart"] = "Done (16/16)"
-            self._log("Bart: all blocks sorted.", "ok")
+            if not self.stop_signal.is_set():
+                self._status["Bart"] = "Done (16/16)"
+                self._bart_cycle_count = 0   # reset for a potential new run
+                self._log("Bart: all blocks sorted.", "ok")
 
+        except InterruptedError:
+            self._status["Bart"] = "E-stopped"
+            self._log(f"Bart stopped by E-stop (completed {self._bart_cycle_count}/16 cycles).", "warn")
         except Exception as exc:
             self._status["Bart"] = "ERROR"
             self._log(f"Bart error: {exc}", "error")
 
     def _marge_worker(self):
         try:
-            self._status["Marge"] = "Connecting..."
-            self.marge = Marge(port='COM6')
-            self.marge.stop_event = self.stop_signal
-            self.marge.setup(tray_lock=self.tray_lock)
-            self._status["Marge"] = "Idle"
-            self._log("Marge online — orders accepted.", "info")
-
-            # Enable the Place Order button now Marge is ready
-            self.root.after(0, lambda: self._place_btn.config(state="disabled"))
+            if self.marge is None:
+                # ── Fresh start ──────────────────────────────────────────────
+                self._status["Marge"] = "Connecting..."
+                self.marge = Marge(port='COM6')
+                self.marge.stop_event = self.stop_signal
+                self.marge.setup(tray_lock=self.tray_lock)
+                self._status["Marge"] = "Idle"
+                self._log("Marge online — orders accepted.", "info")
+            else:
+                # ── Resume after E-stop ──────────────────────────────────────
+                self.marge.stop_event = self.stop_signal
+                self._status["Marge"] = "Resuming..."
+                self._log("Marge resuming — homing rail and returning to safe position.", "warn")
+                self.marge.setup(tray_lock=self.tray_lock)   # re-homes rail, goes safe
+                self._status["Marge"] = "Idle"
 
             while not self.stop_signal.is_set():
                 order = None
@@ -688,25 +796,32 @@ class App:
 
                 if order:
                     summary = ", ".join(f"{q}× {c}" for c, q in order.items())
-                    self._log(f"Marge: fulfilling  [{summary}]  — sorting paused", "marge")
+                    self._log(f"Marge: fulfilling  [{summary}]", "marge")
                     self._status["Marge"] = f"Fulfilling: {summary}"
                     self._marge_active = True
 
-                    self.ok_to_sort.clear()          # Pause Homer & Bart
-                    time.sleep(0.5)                  # Let any in-flight tray move finish
+                    # tray_lock inside fulfil_order/pick_from_tray ensures Bart
+                    # moves clear before Marge ever enters the tray — no need to
+                    # pause Homer & Bart for the entire order duration.
                     self.marge.fulfil_order(order, self.bart.colour_counts)
-                    self.ok_to_sort.set()            # Resume Homer & Bart
 
                     self._marge_active = False
                     self._status["Marge"] = "Idle"
-                    self._log(f"Marge: order complete — sorting resumed.", "marge")
+                    self._log("Marge: order complete.", "marge")
                 else:
                     time.sleep(0.3)
 
             self._status["Marge"] = "Stopped"
 
+        except InterruptedError:
+            self._status["Marge"] = "E-stopped"
+            self._marge_active = False
+            self.ok_to_sort.set()   # don't leave Homer/Bart gated if Marge is gone
+            self._log("Marge stopped by E-stop.", "warn")
         except Exception as exc:
             self._status["Marge"] = "ERROR"
+            self._marge_active = False
+            self.ok_to_sort.set()
             self._log(f"Marge error: {exc}", "error")
 
 

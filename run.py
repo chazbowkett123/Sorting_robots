@@ -13,13 +13,9 @@ marge = Marge(port='COM6')
 #
 #   tray_lock      — Mutex: Bart (place) and Marge (pick) must never touch the
 #                    trays at the same time. Both acquire this before any tray move.
-#
-#   ok_to_sort     — Normally SET (green light). Marge CLEARS it when she starts
-#                    an order; Homer and Bart pause at safe points until it is
-#                    SET again. This drains the pipeline cleanly:
-#                      • Homer won't pick the next grid block.
-#                      • Bart won't start the belt-travel timer for the next block.
-#                    Any block already on the belt finishes its sort via tray_lock.
+#   ok_to_sort     — Reserved for future use / user pause. Marge no longer clears
+#                    this during orders — tray_lock provides exact mutual exclusion
+#                    so Bart can sort freely while Marge travels to/from dispatch.
 #
 #   homer_at_sensor    — Set by Homer's hold_over_colour_sensor() once the arm is
 #                        fully lowered and stable. Cleared when Homer lifts away.
@@ -53,12 +49,9 @@ def run_homer():
 
         print(f"\n[Homer] === Block {block_index + 1}/16 ===")
 
-        # Gate — do NOT pick the next block until:
-        #   1. Bart has finished placing the previous block (bart_ready_to_scan)
-        #   2. Marge is not currently fulfilling an order (ok_to_sort)
-        # Order matters: check ok_to_sort first so a Marge pause takes effect
-        # immediately, then wait for Bart so we never out-run the sorter.
-        ok_to_sort.wait()
+        # Gate — do NOT pick the next block until Bart has finished placing the
+        # previous block. tray_lock inside pick_from_tray handles Marge collision,
+        # so no need to pause Homer for the duration of a Marge order.
         bart_ready_to_scan.wait()
         if stop_signal.is_set():
             break
@@ -103,11 +96,8 @@ def run_bart():
         block_on_belt.wait()
         block_on_belt.clear()
 
-        # If Marge is fulfilling an order, pause here — don't start the belt
-        # travel timer until the trays are free again. Any block already on the
-        # belt at the moment ok_to_sort was cleared will finish this wait and
-        # then acquire tray_lock below to safely place without colliding with Marge.
-        ok_to_sort.wait()
+        # tray_lock inside place_block() ensures Bart and Marge never touch the
+        # tray simultaneously — Bart can sort freely while Marge is in transit.
         if stop_signal.is_set():
             break
 
@@ -142,21 +132,11 @@ def run_marge():
 
         if order:
             print(f"\n[Marge] *** Order received: {order}")
-            print("[Marge] *** Pausing Homer & Bart...")
-
-            # Clear the green light — Homer & Bart pause at their next safe point
-            ok_to_sort.clear()
-
-            # Brief settle: give Bart time to finish any tray placement that was
-            # already in progress before the pause takes effect. tray_lock below
-            # also protects against any race, but the sleep keeps prints clean.
-            time.sleep(0.5)
-
+            # tray_lock inside fulfil_order/pick_from_tray guarantees Bart's arm
+            # is fully clear before Marge enters the tray — no need to pause
+            # Homer & Bart for the whole order duration.
             marge.fulfil_order(order, bart.colour_counts)
-
-            # Restore the green light — Homer & Bart resume
-            ok_to_sort.set()
-            print("[Marge] *** Order fulfilled — Homer & Bart resumed ***\n")
+            print("[Marge] *** Order fulfilled ***\n")
         else:
             time.sleep(0.3)
 

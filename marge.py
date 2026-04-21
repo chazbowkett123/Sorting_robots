@@ -64,9 +64,13 @@ class Marge:
         Move to (x,y,z,r) using distance polling instead of wait=True.
         Raises InterruptedError immediately if stop_event is set.
         """
+        # Pre-check: don't dispatch a new move if stop is already set
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise InterruptedError("E-stop before move")
         self.device.move_to(x, y, z, r, wait=False)
         while True:
             if self.stop_event is not None and self.stop_event.is_set():
+                self.hw_stop()   # called from worker thread — thread safe; also stops stepper
                 raise InterruptedError("E-stop during move")
             try:
                 pose = self.device.get_pose()
@@ -77,15 +81,18 @@ class Marge:
                     return
             except Exception:
                 return
-            time.sleep(0.05)
+            time.sleep(0.01)   # 10 ms — 5× faster detection
 
     def _sleep(self, seconds):
-        """sleep() that wakes immediately if stop_event is set."""
+        """sleep() that wakes immediately if stop_event is set.
+        IMPORTANT: rail travel is timed by this sleep — hw_stop() here also
+        halts the stepper motor immediately."""
         deadline = time.time() + seconds
         while time.time() < deadline:
             if self.stop_event is not None and self.stop_event.is_set():
+                self.hw_stop()   # stops rail stepper + arm queue + suction
                 raise InterruptedError("E-stop during sleep")
-            time.sleep(0.05)
+            time.sleep(0.01)   # 10 ms
 
     def hw_stop(self):
         """Tell the Dobot hardware to stop executing its command queue NOW."""

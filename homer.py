@@ -46,26 +46,32 @@ class Homer:
         deadline = time.time() + seconds
         while time.time() < deadline:
             if self.stop_event is not None and self.stop_event.is_set():
+                self.hw_stop()
                 raise InterruptedError("E-stop during sleep")
-            time.sleep(0.05)
+            time.sleep(0.01)   # 10 ms
 
     def hw_stop(self):
         """Tell the Dobot hardware to stop executing its command queue NOW."""
         try:
-            self.device._set_queued_cmd_stop_exec()
-            self.device._set_queued_cmd_clear()
-            self.device.suck(False)
+            with self.lock:
+                self.device._set_queued_cmd_stop_exec()
+                self.device._set_queued_cmd_clear()
+                self.device.suck(False)
         except Exception:
             pass
 
     def _move(self, x, y, z, r, wait=True):
         """Thread-safe move with distance polling. Raises InterruptedError on E-stop."""
+        # Pre-check: refuse to dispatch a new move if stop is already set
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise InterruptedError("E-stop before move")
         with self.lock:
             self.device.move_to(x, y, z, r, wait=False)
 
         if wait:
             while True:
                 if self.stop_event is not None and self.stop_event.is_set():
+                    self.hw_stop()   # called from worker thread — thread safe
                     raise InterruptedError("E-stop during move")
                 with self.lock:
                     try:
@@ -78,7 +84,7 @@ class Homer:
                             (pose.position.z - z) ** 2) ** 0.5
                     if dist < 2.5:
                         break
-                time.sleep(0.05)
+                time.sleep(0.01)   # 10 ms — 5× faster detection
 
     def get_grid_position(self, index):
         """
