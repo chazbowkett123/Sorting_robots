@@ -531,11 +531,11 @@ class App:
         self._start_btn.config(state="normal")
         self._pause_btn.config(state="disabled")
         self._place_btn.config(state="disabled")
-        # Cut suction on all robots immediately
+        # Stop hardware command queues and cut suction on all robots immediately
         for robot in (self.homer, self.bart, self.marge):
             if robot:
                 try:
-                    robot.device.suck(False)
+                    robot.hw_stop()          # clears Dobot queue → arm decelerates to halt
                     robot.device.clear_alarms()
                 except Exception:
                     pass
@@ -564,6 +564,7 @@ class App:
         try:
             self._status["Homer"] = "Connecting..."
             self.homer = Homer(port='COM7')
+            self.homer.stop_event = self.stop_signal
             self.homer.setup()
             self._status["Homer"] = "Ready"
             self._log("Homer online.", "info")
@@ -602,6 +603,7 @@ class App:
         try:
             self._status["Bart"] = "Connecting..."
             self.bart = Bart(port='COM8')
+            self.bart.stop_event = self.stop_signal
             self.bart.setup()
             self._status["Bart"] = "Ready"
             self._log("Bart online.", "info")
@@ -638,7 +640,14 @@ class App:
                     break
 
                 self._status["Bart"] = "Waiting for belt travel..."
-                time.sleep(5.0)
+                # Interruptible — checks stop_signal every 50 ms
+                deadline = time.time() + 5.0
+                while time.time() < deadline:
+                    if self.stop_signal.is_set():
+                        break
+                    time.sleep(0.05)
+                if self.stop_signal.is_set():
+                    break
 
                 self._status["Bart"] = f"Sorting: {label}"
                 self.bart.pick_from_conveyor()
@@ -663,6 +672,7 @@ class App:
         try:
             self._status["Marge"] = "Connecting..."
             self.marge = Marge(port='COM6')
+            self.marge.stop_event = self.stop_signal
             self.marge.setup(tray_lock=self.tray_lock)
             self._status["Marge"] = "Idle"
             self._log("Marge online — orders accepted.", "info")

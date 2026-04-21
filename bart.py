@@ -35,6 +35,7 @@ class Bart:
         self.device.speed(velocity=40, acceleration=40)
         self.last_colour = None
         self.colour_counts = {'red': 0, 'blue': 0, 'green': 0, 'unknown': 0}
+        self.stop_event = None   # Set externally to enable interruptible moves
         print("[Bart] Connected.")
 
     def setup(self):
@@ -56,31 +57,66 @@ class Bart:
 
     # ── Movement ────────────────────────────────────────────────────────────────
 
+    # ── Interruptible primitives ────────────────────────────────────────────────
+
+    def _move(self, x, y, z, r):
+        """
+        Move to (x,y,z,r) using distance polling instead of wait=True.
+        Raises InterruptedError immediately if stop_event is set, so E-stop
+        propagates up through any in-progress pick/place/safe move.
+        """
+        self.device.move_to(x, y, z, r, wait=False)
+        while True:
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise InterruptedError("E-stop during move")
+            try:
+                pose = self.device.get_pose()
+                dist = ((pose.position.x - x) ** 2 +
+                        (pose.position.y - y) ** 2 +
+                        (pose.position.z - z) ** 2) ** 0.5
+                if dist < 2.0:
+                    return
+            except Exception:
+                return
+            time.sleep(0.05)
+
+    def _sleep(self, seconds):
+        """sleep() that wakes immediately if stop_event is set."""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise InterruptedError("E-stop during sleep")
+            time.sleep(0.05)
+
+    def hw_stop(self):
+        """Tell the Dobot hardware to stop executing its command queue NOW."""
+        try:
+            self.device._set_queued_cmd_stop_exec()
+            self.device._set_queued_cmd_clear()
+            self.device.suck(False)
+        except Exception:
+            pass
+
+    # ── Movement ─────────────────────────────────────────────────────────────────
+
     def go_safe(self):
         """
         Move to BART_SAFE_POSITION — fully clear of the tray area.
-        Must be called (and complete) before releasing tray_lock so that
-        Marge can never enter the tray while Bart's arm is still above it.
+        Called inside tray_lock so Marge cannot enter until Bart is gone.
         """
         x, y, z, r = BART_SAFE_POSITION
         pose = self.device.get_pose()
         if pose.position.z < SAFE_Z:
-            self.device.move_to(
-                pose.position.x, pose.position.y,
-                SAFE_Z, pose.position.r, wait=True
-            )
-        self.device.move_to(x, y, z, r, wait=True)
+            self._move(pose.position.x, pose.position.y, SAFE_Z, pose.position.r)
+        self._move(x, y, z, r)
         print("[Bart] At safe position.")
 
     def _safe_move(self, x, y, z, r):
         """Lift to SAFE_Z → travel horizontally → lower. Never diagonal."""
         pose = self.device.get_pose()
-        self.device.move_to(
-            pose.position.x, pose.position.y,
-            SAFE_Z, pose.position.r, wait=True
-        )
-        self.device.move_to(x, y, SAFE_Z, r, wait=True)
-        self.device.move_to(x, y, z, r, wait=True)
+        self._move(pose.position.x, pose.position.y, SAFE_Z, pose.position.r)
+        self._move(x, y, SAFE_Z, r)
+        self._move(x, y, z, r)
 
     # ── Colour reading ──────────────────────────────────────────────────────────
 
@@ -140,8 +176,8 @@ class Bart:
         x, y, z, r = CONV_PICKUP
         self._safe_move(x, y, z, r)
         self.device.suck(True)
-        time.sleep(0.5)
-        self.device.move_to(x, y, SAFE_Z, r, wait=True)
+        self._sleep(0.5)
+        self._move(x, y, SAFE_Z, r)
         print("[Bart] Block picked.")
 
     def place_block(self):
@@ -176,11 +212,11 @@ class Bart:
 
         print(f"[Bart] Placing {colour} block #{count + 1} (col {count}) at ({x:.1f}, {y:.1f}, {z:.1f})...")
 
-        self.device.move_to(x, y, SAFE_Z, r, wait=True)
-        self.device.move_to(x, y, z, r, wait=True)
+        self._move(x, y, SAFE_Z, r)
+        self._move(x, y, z, r)
         self.device.suck(False)
-        time.sleep(0.5)
-        self.device.move_to(x, y, SAFE_Z, r, wait=True)
+        self._sleep(0.5)
+        self._move(x, y, SAFE_Z, r)
 
         self.colour_counts[colour] += 1
         print(f"[Bart] Placed. {colour} count: {self.colour_counts[colour]}/4")

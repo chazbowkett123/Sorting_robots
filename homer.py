@@ -33,32 +33,50 @@ class Homer:
 
         # Synchronisation tools
         self.lock = threading.Lock()
-        self.conveyor_thread = None 
+        self.conveyor_thread = None
+        self.stop_event = None   # Set externally to enable interruptible moves
 
         print("[Homer] Connected.")
 
     def setup(self):
         print("[Homer] Ready (homing skipped for testing).")
 
+    def _sleep(self, seconds):
+        """sleep() that wakes immediately if stop_event is set."""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise InterruptedError("E-stop during sleep")
+            time.sleep(0.05)
+
+    def hw_stop(self):
+        """Tell the Dobot hardware to stop executing its command queue NOW."""
+        try:
+            self.device._set_queued_cmd_stop_exec()
+            self.device._set_queued_cmd_clear()
+            self.device.suck(False)
+        except Exception:
+            pass
+
     def _move(self, x, y, z, r, wait=True):
-        """Thread-safe move function with position polling."""
+        """Thread-safe move with distance polling. Raises InterruptedError on E-stop."""
         with self.lock:
             self.device.move_to(x, y, z, r, wait=False)
-        
+
         if wait:
             while True:
+                if self.stop_event is not None and self.stop_event.is_set():
+                    raise InterruptedError("E-stop during move")
                 with self.lock:
                     try:
                         pose = self.device.get_pose()
                     except Exception:
                         pose = None
-                
                 if pose is not None:
-                    dist = ((pose.position.x - x)**2 + 
-                            (pose.position.y - y)**2 + 
-                            (pose.position.z - z)**2)**0.5
-                    
-                    if dist < 2.5: 
+                    dist = ((pose.position.x - x) ** 2 +
+                            (pose.position.y - y) ** 2 +
+                            (pose.position.z - z) ** 2) ** 0.5
+                    if dist < 2.5:
                         break
                 time.sleep(0.05)
 
@@ -106,7 +124,7 @@ class Homer:
         # Signal that Homer is stable at the sensor — safe to scan now
         if at_sensor_event is not None:
             at_sensor_event.set()
-        time.sleep(1.0)
+        self._sleep(1.0)
         if at_sensor_event is not None:
             at_sensor_event.clear()
         self._move(COLOUR_SENSOR[0], COLOUR_SENSOR[1], SAFE_Z, COLOUR_SENSOR[3], wait=True)

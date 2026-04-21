@@ -47,6 +47,7 @@ class Marge:
         self.slots_taken  = {'red': 0, 'blue': 0, 'green': 0}
         self.tray_lock    = None
         self.rail_pos_mm  = 0.0
+        self.stop_event   = None   # Set externally to enable interruptible moves
 
         print("[Marge] Connected. Suction off.")
 
@@ -55,6 +56,46 @@ class Marge:
         print("[Marge] Initialising...")
         self.go_to_safe()
         print("[Marge] Ready.")
+
+    # ── Interruptible primitives ─────────────────────────────────────────────────
+
+    def _move(self, x, y, z, r):
+        """
+        Move to (x,y,z,r) using distance polling instead of wait=True.
+        Raises InterruptedError immediately if stop_event is set.
+        """
+        self.device.move_to(x, y, z, r, wait=False)
+        while True:
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise InterruptedError("E-stop during move")
+            try:
+                pose = self.device.get_pose()
+                dist = ((pose.position.x - x) ** 2 +
+                        (pose.position.y - y) ** 2 +
+                        (pose.position.z - z) ** 2) ** 0.5
+                if dist < 2.0:
+                    return
+            except Exception:
+                return
+            time.sleep(0.05)
+
+    def _sleep(self, seconds):
+        """sleep() that wakes immediately if stop_event is set."""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise InterruptedError("E-stop during sleep")
+            time.sleep(0.05)
+
+    def hw_stop(self):
+        """Tell the Dobot hardware to stop executing its command queue NOW."""
+        try:
+            self.device._set_queued_cmd_stop_exec()
+            self.device._set_queued_cmd_clear()
+            self.device._set_stepper_motor(speed=0, interface=RAIL_INTERFACE)
+            self.device.suck(False)
+        except Exception:
+            pass
 
     # ── Queue management ─────────────────────────────────────────────────────────
 
@@ -75,9 +116,9 @@ class Marge:
         """
         x, y, z, r = MARGE_SAFE_POSITION
         pose = self.device.get_pose()
-        self.device.move_to(pose.position.x, pose.position.y, SAFE_Z, pose.position.r, wait=True)
-        self.device.move_to(x, y, SAFE_Z, r, wait=True)
-        self.device.move_to(x, y, z, r, wait=True)
+        self._move(pose.position.x, pose.position.y, SAFE_Z, pose.position.r)
+        self._move(x, y, SAFE_Z, r)
+        self._move(x, y, z, r)
         print("[Marge] Arm at safe position.")
 
     # ── Rail movement ────────────────────────────────────────────────────────────
@@ -103,9 +144,9 @@ class Marge:
 
         print(f"[Marge] Rail {direction} to {target_mm:.0f}mm ({duration:.2f}s)...")
         self.device._set_stepper_motor(speed=speed, interface=RAIL_INTERFACE)
-        time.sleep(duration)
+        self._sleep(duration)
         self.device._set_stepper_motor(speed=0, interface=RAIL_INTERFACE)
-        time.sleep(0.5)
+        self._sleep(0.5)
         self._flush_queue()
 
         self.rail_pos_mm = target_mm
@@ -116,9 +157,9 @@ class Marge:
     def _safe_move(self, x, y, z, r):
         """Lift to SAFE_Z → travel horizontally → lower."""
         pose = self.device.get_pose()
-        self.device.move_to(pose.position.x, pose.position.y, SAFE_Z, pose.position.r, wait=True)
-        self.device.move_to(x, y, SAFE_Z, r, wait=True)
-        self.device.move_to(x, y, z, r, wait=True)
+        self._move(pose.position.x, pose.position.y, SAFE_Z, pose.position.r)
+        self._move(x, y, SAFE_Z, r)
+        self._move(x, y, z, r)
 
     # ── Tray access ─────────────────────────────────────────────────────────────
 
@@ -156,7 +197,7 @@ class Marge:
             self.move_rail(RAIL_TRAY_MM)
             self._safe_move(x, y, z, r)
             self.device.suck(True)
-            time.sleep(0.5)
+            self._sleep(0.5)
             self.go_to_safe()
 
         self.slots_taken[colour] += 1
@@ -171,7 +212,7 @@ class Marge:
         self.move_rail(RAIL_DISPATCH_MM)
         self._safe_move(*DISPATCH_BOX)
         self.device.suck(False)
-        time.sleep(0.3)
+        self._sleep(0.3)
         self.go_to_safe()
         print("[Marge] Block delivered — at safe position.")
 
