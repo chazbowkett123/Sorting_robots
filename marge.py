@@ -3,11 +3,15 @@ import threading
 from pydobotplus import Dobot
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-RAIL_INTERFACE  = 1
-RAIL_SPEED      = 5000
-PULSES_PER_MM   = 80
-MAX_TRAVEL_MM   = 1065
-SAFE_Z          = 20
+RAIL_INTERFACE    = 1
+PULSES_PER_MM     = 80
+MAX_TRAVEL_MM     = 1065
+SAFE_Z            = 20
+
+# ── Ramping Settings ───────────────────────────────────────────────────────────
+MAX_RAIL_SPEED    = 6000  # Cruising speed
+START_RAIL_SPEED  = 1500  # Pull-in speed to avoid stalling
+RAIL_RAMP_TIME    = 0.8   # Time in seconds for accel/decel phases
 
 # ── Rail positions (mm from home) ──────────────────────────────────────────────
 RAIL_TRAY_MM     = 0
@@ -23,7 +27,6 @@ TRAY_BLUE  = (207.2, -46.2, -37.7, 0.0)
 TRAY_GREEN = (183.2, -66.9, -38.1, 0.0)
 
 # Diagonal step per slot — derived from measured row 1 → row 2 difference
-# Red:   (+23.7, -21.5)   Blue: (+21.9, -21.9)   Green: (+21.0, -24.1)
 TRAY_STEP = {
     'red':   (23.7, -21.5, 0.0),
     'blue':  (21.9, -21.9, 0.0),
@@ -64,13 +67,12 @@ class Marge:
         Move to (x,y,z,r) using distance polling instead of wait=True.
         Raises InterruptedError immediately if stop_event is set.
         """
-        # Pre-check: don't dispatch a new move if stop is already set
         if self.stop_event is not None and self.stop_event.is_set():
             raise InterruptedError("E-stop before move")
         self.device.move_to(x, y, z, r, wait=False)
         while True:
             if self.stop_event is not None and self.stop_event.is_set():
-                self.hw_stop()   # called from worker thread — thread safe; also stops stepper
+                self.hw_stop()
                 raise InterruptedError("E-stop during move")
             try:
                 pose = self.device.get_pose()
@@ -81,18 +83,16 @@ class Marge:
                     return
             except Exception:
                 return
-            time.sleep(0.01)   # 10 ms — 5× faster detection
+            time.sleep(0.01)
 
     def _sleep(self, seconds):
-        """sleep() that wakes immediately if stop_event is set.
-        IMPORTANT: rail travel is timed by this sleep — hw_stop() here also
-        halts the stepper motor immediately."""
+        """sleep() that wakes immediately if stop_event is set."""
         deadline = time.time() + seconds
         while time.time() < deadline:
             if self.stop_event is not None and self.stop_event.is_set():
-                self.hw_stop()   # stops rail stepper + arm queue + suction
+                self.hw_stop()
                 raise InterruptedError("E-stop during sleep")
-            time.sleep(0.01)   # 10 ms
+            time.sleep(0.01)
 
     def hw_stop(self):
         """Tell the Dobot hardware to stop executing its command queue NOW."""
@@ -128,11 +128,11 @@ class Marge:
         self._move(x, y, z, r)
         print("[Marge] Arm at safe position.")
 
-    # ── Rail movement ────────────────────────────────────────────────────────────
+    # ── Rail movement (WITH RAMPING) ─────────────────────────────────────────────
 
     def move_rail(self, target_mm):
         """
-        Move rail to target mm from home.
+        Move rail to target mm from home using a trapezoidal acceleration profile.
         Always moves arm to safe position first.
         """
         target_mm = max(0, min(target_mm, MAX_TRAVEL_MM))
@@ -145,13 +145,40 @@ class Marge:
         self.go_to_safe()
         self._flush_queue()
 
-        duration  = abs(delta_mm * PULSES_PER_MM) / RAIL_SPEED
-        speed     = -RAIL_SPEED if delta_mm > 0 else RAIL_SPEED
-        direction = "forward" if delta_mm > 0 else "backward"
+        delta_pulses = int(delta_mm * PULSES_PER_MM)
+        direction_mult = -1 if delta_pulses > 0 else 1
+        direction_str = "forward" if delta_pulses > 0 else "backward"
 
-        print(f"[Marge] Rail {direction} to {target_mm:.0f}mm ({duration:.2f}s)...")
-        self.device._set_stepper_motor(speed=speed, interface=RAIL_INTERFACE)
-        self._sleep(duration)
+        # Calculate pulses consumed during the accel and decel phases
+        ramp_distance_pulses = ((MAX_RAIL_SPEED + START_RAIL_SPEED) / 2) * RAIL_RAMP_TIME
+
+        print(f"[Marge] Rail {direction_str} to {target_mm:.0f}mm (Max Speed: {MAX_RAIL_SPEED})...")
+
+        # If the move is too short to safely ramp up and down, just do it slowly
+        if abs(delta_pulses) < (ramp_distance_pulses * 2):
+            duration = abs(delta_pulses) / START_RAIL_SPEED
+            self.device._set_stepper_motor(speed=START_RAIL_SPEED * direction_mult, interface=RAIL_INTERFACE)
+            self._sleep(duration)
+        else:
+            # 1. ACCELERATE
+            self.device._set_stepper_motor(speed=START_RAIL_SPEED * direction_mult, interface=RAIL_INTERFACE)
+            self._sleep(RAIL_RAMP_TIME / 2)
+            self.device._set_stepper_motor(speed=int((START_RAIL_SPEED + MAX_RAIL_SPEED)/2) * direction_mult, interface=RAIL_INTERFACE)
+            self._sleep(RAIL_RAMP_TIME / 2)
+
+            # 2. CRUISE
+            cruise_pulses = abs(delta_pulses) - (ramp_distance_pulses * 2)
+            cruise_duration = cruise_pulses / MAX_RAIL_SPEED
+            self.device._set_stepper_motor(speed=MAX_RAIL_SPEED * direction_mult, interface=RAIL_INTERFACE)
+            self._sleep(cruise_duration)
+
+            # 3. DECELERATE
+            self.device._set_stepper_motor(speed=int((START_RAIL_SPEED + MAX_RAIL_SPEED)/2) * direction_mult, interface=RAIL_INTERFACE)
+            self._sleep(RAIL_RAMP_TIME / 2)
+            self.device._set_stepper_motor(speed=START_RAIL_SPEED * direction_mult, interface=RAIL_INTERFACE)
+            self._sleep(RAIL_RAMP_TIME / 2)
+
+        # Full Stop
         self.device._set_stepper_motor(speed=0, interface=RAIL_INTERFACE)
         self._sleep(0.5)
         self._flush_queue()
@@ -171,10 +198,6 @@ class Marge:
     # ── Tray access ─────────────────────────────────────────────────────────────
 
     def _get_tray_position(self, colour, slot):
-        """
-        Calculate tray position for a given colour and slot.
-        Uses diagonal offset — each subsequent block shifts in both X and Y.
-        """
         if   colour == 'red':   base = TRAY_RED
         elif colour == 'blue':  base = TRAY_BLUE
         elif colour == 'green': base = TRAY_GREEN
@@ -189,16 +212,18 @@ class Marge:
         return x, y, z, r
 
     def pick_from_tray(self, colour, bart_colour_counts):
-        """Pick next available block of given colour from tray."""
         available = bart_colour_counts.get(colour, 0) - self.slots_taken.get(colour, 0)
         if available <= 0:
             print(f"[Marge] No {colour} blocks available in tray.")
             return False
 
-        slot = self.slots_taken[colour]
+        # Ring-buffer: physical slot index wraps mod 4 to match Bart's placement
+        slot     = self.slots_taken[colour] % 4
         x, y, z, r = self._get_tray_position(colour, slot)
 
-        print(f"[Marge] Picking {colour} block from slot {slot + 1} at ({x:.1f}, {y:.1f}, {z:.1f})...")
+        print(f"[Marge] Picking {colour} from physical slot {slot} "
+              f"(dispatched so far: {self.slots_taken[colour]}) "
+              f"at ({x:.1f}, {y:.1f}, {z:.1f})...")
 
         with self.tray_lock:
             self.move_rail(RAIL_TRAY_MM)
@@ -213,26 +238,60 @@ class Marge:
 
     # ── Dispatch ────────────────────────────────────────────────────────────────
 
-    def deliver_to_box(self):
-        """Move rail to dispatch, lower into box, release block."""
+    def deliver_to_box(self, expected_colour=None, verify_fn=None):
+        """
+        Deliver the held block to the dispatch box.
+
+        Parameters
+        ----------
+        expected_colour : str or None
+            Colour the block is supposed to be (passed to verify_fn).
+        verify_fn : callable or None
+            Optional verification callback: ``verify_fn(expected_colour)``
+            → (passed: bool, intensity: float|None, detected: str|None).
+            Called after the arm returns to safe position so the camera has
+            an unobstructed view of the dispatch zone.
+        """
         print("[Marge] Delivering to dispatch box...")
         self.move_rail(RAIL_DISPATCH_MM)
         self._safe_move(*DISPATCH_BOX)
         self.device.suck(False)
         self._sleep(0.3)
         self.go_to_safe()
+
+        # Allow the block to settle, then verify if a camera callback was given
+        if verify_fn is not None:
+            self._sleep(0.5)   # brief settle before capture
+            try:
+                passed, detected, _roi = verify_fn(expected_colour)
+                if passed:
+                    print(f"[Marge] Camera verify: PASS ✓  (detected={detected})")
+                else:
+                    print(f"[Marge] Camera verify: FAIL ✗  "
+                          f"(expected={expected_colour}, detected={detected})")
+            except Exception as exc:
+                print(f"[Marge] Camera verify error: {exc}")
+
         print("[Marge] Block delivered — at safe position.")
 
     # ── Order handling ───────────────────────────────────────────────────────────
 
     def add_order(self, order):
-        """Add an order dict to the queue. e.g. {'red': 2, 'blue': 1}"""
         with self.order_lock:
             self.order_queue.append(order)
         print(f"[Marge] Order added: {order}")
 
-    def fulfil_order(self, order, bart_colour_counts):
-        """Pick and deliver each block in the order."""
+    def fulfil_order(self, order, bart_colour_counts, verify_fn=None):
+        """
+        Fulfil an order by picking each block from the tray and delivering it.
+
+        Parameters
+        ----------
+        order : dict  {colour: qty}
+        bart_colour_counts : dict  Bart's running placement totals.
+        verify_fn : callable or None
+            Passed through to deliver_to_box() — see that method for details.
+        """
         print(f"[Marge] Fulfilling order: {order}")
         for colour, qty in order.items():
             for i in range(qty):
@@ -241,13 +300,12 @@ class Marge:
                 if not success:
                     print(f"[Marge] WARNING: No {colour} block available — skipping.")
                     continue
-                self.deliver_to_box()
+                self.deliver_to_box(expected_colour=colour, verify_fn=verify_fn)
         print("[Marge] Order complete — returning rail to home...")
         self.move_rail(RAIL_TRAY_MM)
         print(f"[Marge] Order done: {order}")
 
     def run(self, bart_colour_counts):
-        """Main loop — checks order queue and fulfils orders."""
         print("[Marge] Waiting for orders...")
         while True:
             order = None
